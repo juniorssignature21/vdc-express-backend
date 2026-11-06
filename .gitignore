@@ -1,0 +1,8 @@
+.venv/
+.env
+*.db
+uploads/
+staticfiles/
+__pycache__/
+.pytest_cache/
+.vercel
