@@ -42,6 +42,11 @@ class GatewayError(APIException):
     default_detail = "The payment provider didn't respond. Please try again."
 
 
+def api_error(e: "gateway.GatewayError") -> APIException:
+    """Customer-facing API error for a payment problem (the details are already in the log)."""
+    return PaymentUnavailable(str(e)) if e.unavailable else GatewayError(str(e))
+
+
 def price(serializer) -> dict:
     try:
         return calc_quote(serializer.spec())
@@ -78,7 +83,7 @@ def _new_intent(ref: str, attempt: int, amount: float, email: str, product: str)
             metadata={"booking": ref, "product": product}, idempotency_key=f"booking-{ref}-{attempt}",
         )
     except gateway.GatewayError as e:
-        raise GatewayError(str(e))
+        raise api_error(e)
 
 
 def _payment_payload(b: Booking, intent: dict) -> dict:
@@ -92,7 +97,9 @@ class BookingCreateView(APIView):
     throttle_scope = "public_form"
 
     def post(self, request):
-        if not gateway.enabled():
+        problem = gateway.config_problem()
+        if problem:
+            log.error("Online booking refused, Stripe is not configured: %s", problem)
             raise PaymentUnavailable("Online card payments aren't set up yet. Please contact us to book.")
         s = BookingSerializer(data=request.data)
         s.is_valid(raise_exception=True)
@@ -133,7 +140,7 @@ class BookingRetryView(APIView):
         try:
             intent = gateway.retrieve_intent(b.pay_reference)
         except gateway.GatewayError as e:
-            raise GatewayError(str(e))
+            raise api_error(e)
         if intent.get("status") == "succeeded":
             finalize(b.pay_reference)
             b.refresh_from_db()
@@ -162,7 +169,7 @@ def booking_verify_view(request):
         try:
             finalize(b.pay_reference)
         except gateway.GatewayError as e:
-            raise GatewayError(str(e))
+            raise api_error(e)
         b.refresh_from_db()
     return Response(BookingPublicSerializer(b).data)
 
@@ -181,8 +188,7 @@ def stripe_webhook(request):
             return HttpResponse(status=400)
         try:  # finalize() only calls Stripe for an unpaid booking that owns this PaymentIntent
             finalize(intent_id)  # always re-reads the PaymentIntent; the event body is only a trigger
-        except gateway.GatewayError:
-            log.exception("Stripe lookup failed for %s", intent_id)
+        except gateway.GatewayError:  # reason already logged by the gateway
             return HttpResponse(status=502)  # Stripe retries
     return HttpResponse(status=200)
 

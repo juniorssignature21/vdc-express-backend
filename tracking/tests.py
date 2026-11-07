@@ -367,6 +367,44 @@ def test_stripe_intent_is_card_only(monkeypatch, settings):
     assert sent["options"] == {"idempotency_key": "k"}
 
 
+def test_stripe_errors_are_not_shown_to_customers(client, monkeypatch, settings, caplog):
+    import stripe
+    from tracking import stripe_gateway
+
+    def fail(exc):
+        class Intents:
+            def create(self, params, options):
+                raise exc
+
+        class FakeClient:
+            payment_intents = Intents()
+        monkeypatch.setattr(stripe_gateway.stripe, "StripeClient", lambda *a, **k: FakeClient())
+
+    # bad secret key: generic 503, Stripe's message (with the masked key) only in the log
+    fail(stripe.AuthenticationError("Invalid API Key provided: sk_test_****c63a", http_status=401))
+    with caplog.at_level("CRITICAL", logger="tracking"):
+        r = client.post("/api/bookings", BOOKING, format="json")
+    assert r.status_code == 503 and "temporarily unavailable" in r.json()["detail"]
+    assert "sk_test" not in r.content.decode() and "c63a" in caplog.text and "TP_STRIPE_SECRET_KEY" in caplog.text
+
+    fail(stripe.APIConnectionError("Network error"))
+    r = client.post("/api/bookings", BOOKING, format="json")
+    assert r.status_code == 502 and "try again" in r.json()["detail"]
+
+    fail(stripe.InvalidRequestError("No such customer: cus_123", param="customer", http_status=400))
+    r = client.post("/api/bookings", BOOKING, format="json")
+    assert r.status_code == 502 and "cus_123" not in r.content.decode()
+
+    # obviously wrong keys switch payments off before any Stripe call
+    settings.STRIPE = {**settings.STRIPE, "SECRET_KEY": "pk_test_oops"}
+    assert "publishable key" in stripe_gateway.config_problem()
+    assert client.get("/api/settings").json()["payments_enabled"] is False
+    r = client.post("/api/bookings", BOOKING, format="json")
+    assert r.status_code == 503 and "aren't set up yet" in r.json()["detail"]
+    settings.STRIPE = {**settings.STRIPE, "SECRET_KEY": "sk_live_x"}
+    assert "different modes" in stripe_gateway.config_problem()
+
+
 def test_webhook_without_signing_secret(client, gateway, settings):
     """No TP_STRIPE_WEBHOOK_SECRET: events are unsigned triggers; Stripe itself decides whether a booking is paid."""
     import json as _json

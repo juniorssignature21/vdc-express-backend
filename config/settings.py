@@ -198,11 +198,24 @@ FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 
 # Stripe: card payments taken on our own booking page with the Payment Element (no hosted checkout redirect).
 # Keys: dashboard -> Developers -> API keys (use the test keys, sk_test_/pk_test_, until you go live).
+def _key(name):  # tolerate stray spaces/quotes pasted into the Vercel dashboard
+    return env(name).strip().strip("'\"").strip()
+
+
 STRIPE = {
-    "SECRET_KEY": env("STRIPE_SECRET_KEY"),
-    "PUBLISHABLE_KEY": env("STRIPE_PUBLISHABLE_KEY"),     # safe to expose; sent to the page via /api/settings
-    "WEBHOOK_SECRET": env("STRIPE_WEBHOOK_SECRET"),       # optional whsec_...; events are re-checked with Stripe anyway
+    "SECRET_KEY": _key("STRIPE_SECRET_KEY"),
+    "PUBLISHABLE_KEY": _key("STRIPE_PUBLISHABLE_KEY"),    # safe to expose; sent to the page via /api/settings
+    "WEBHOOK_SECRET": _key("STRIPE_WEBHOOK_SECRET"),      # optional whsec_...; events are re-checked with Stripe anyway
     "CURRENCY": TRACKPRO["CURRENCY_CODE"].upper(),        # charged in the site currency (USD)
     "STATEMENT_SUFFIX": env("STRIPE_STATEMENT_SUFFIX"),   # optional, appended to the account's statement descriptor
     "SEND_RECEIPTS": env_bool("STRIPE_SEND_RECEIPTS", False),  # Stripe's own emailed receipt (we issue our own)
+}
+
+# App logs (payment problems, gateway errors) go to stderr, which Vercel shows under the deployment's Logs tab.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "%(levelname)s %(name)s: %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
+    "loggers": {"tracking": {"handlers": ["console"], "level": env("LOG_LEVEL", "INFO"), "propagate": False}},
 }

@@ -55,6 +55,14 @@ Setup:
 
 Without keys, the site shows prices but booking returns "Online card payments aren't set up yet".
 
+**When something is wrong with Stripe**, customers only see a plain message ("Online card payments are temporarily unavailable…", "Please try again…", or their bank's decline reason). Stripe's own error, which can mention your API key or account, is written to the server log instead (Vercel → the backend project → Logs), e.g. `CRITICAL tracking.stripe_gateway: Stripe rejected our API key …`. Keys that can't be right (a `pk_` key in the secret key variable, test and live keys mixed, a missing key) switch online payments off and the booking page says so.
+
+Check the keys any time with:
+
+```bash
+python manage.py check_stripe      # "Stripe keys OK (test mode)." or the reason it failed
+```
+
 ## Tests
 
 ```bash
