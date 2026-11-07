@@ -86,8 +86,13 @@ def failure_message(intent: dict) -> str:
 
 
 def parse_webhook(payload: bytes, signature: str) -> dict:
-    """Verify the Stripe-Signature header (raises ValueError / SignatureVerificationError) and return the event."""
+    """Return the webhook event. With TP_STRIPE_WEBHOOK_SECRET set, the Stripe-Signature header is verified (raises
+    ValueError / SignatureVerificationError). Without it the event is read unverified, which is safe here because
+    it is only used as a trigger: finalize() re-reads the PaymentIntent from Stripe with the secret key."""
     secret = settings.STRIPE["WEBHOOK_SECRET"]
-    if not secret:
-        raise ValueError("TP_STRIPE_WEBHOOK_SECRET is not set")
-    return _plain(stripe.Webhook.construct_event(payload, signature, secret))
+    if secret:
+        return _plain(stripe.Webhook.construct_event(payload, signature, secret))
+    event = json.loads(payload)
+    if not isinstance(event, dict):
+        raise ValueError("Not a Stripe event")
+    return event

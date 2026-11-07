@@ -201,7 +201,7 @@ FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 STRIPE = {
     "SECRET_KEY": env("STRIPE_SECRET_KEY"),
     "PUBLISHABLE_KEY": env("STRIPE_PUBLISHABLE_KEY"),     # safe to expose; sent to the page via /api/settings
-    "WEBHOOK_SECRET": env("STRIPE_WEBHOOK_SECRET"),       # whsec_... from the webhook endpoint you add
+    "WEBHOOK_SECRET": env("STRIPE_WEBHOOK_SECRET"),       # optional whsec_...; events are re-checked with Stripe anyway
     "CURRENCY": TRACKPRO["CURRENCY_CODE"].upper(),        # charged in the site currency (USD)
     "STATEMENT_SUFFIX": env("STRIPE_STATEMENT_SUFFIX"),   # optional, appended to the account's statement descriptor
     "SEND_RECEIPTS": env_bool("STRIPE_SEND_RECEIPTS", False),  # Stripe's own emailed receipt (we issue our own)

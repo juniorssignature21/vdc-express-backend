@@ -177,7 +177,9 @@ def stripe_webhook(request):
         return HttpResponse(status=400)
     if event.get("type") in ("payment_intent.succeeded", "payment_intent.payment_failed", "payment_intent.canceled"):
         intent_id = ((event.get("data") or {}).get("object") or {}).get("id", "")
-        try:
+        if not isinstance(intent_id, str) or not intent_id.startswith("pi_"):
+            return HttpResponse(status=400)
+        try:  # finalize() only calls Stripe for an unpaid booking that owns this PaymentIntent
             finalize(intent_id)  # always re-reads the PaymentIntent; the event body is only a trigger
         except gateway.GatewayError:
             log.exception("Stripe lookup failed for %s", intent_id)

@@ -41,7 +41,7 @@ Customers pay on the booking page itself with Stripe's **Payment Element**: ther
 1. `POST /api/bookings` validates addresses and contents, prices the shipment on the server and creates a **card-only** PaymentIntent (`payment_method_types: ["card"]`). It returns the `client_secret` and publishable key.
 2. The page mounts the Payment Element and confirms the payment in place (`redirect: "if_required"`).
 3. `GET /api/bookings/verify?reference=…` re-reads the PaymentIntent from Stripe (`succeeded`, `amount_received`, currency, booking reference in the metadata, paid by card) and only then creates the shipment, a tracking event and a PAID receipt.
-4. `POST /api/stripe/webhook` (`Stripe-Signature` verified) runs the same idempotent step, so a closed browser tab still gets booked.
+4. `POST /api/stripe/webhook` runs the same idempotent step, so a closed browser tab still gets booked. The event is only a trigger: the PaymentIntent is always re-read from Stripe with the secret key, so no webhook signing secret is needed (a forged event can't book anything).
 
 A declined card keeps the same PaymentIntent, so the customer can try another card on the confirmation page (`POST /api/bookings/<ref>/pay`). A payment for the wrong amount or another booking is flagged as failed and shows up under **Online bookings** in the admin.
 
@@ -50,7 +50,7 @@ What customers see from Stripe: only the card fields. Your business name appears
 Setup:
 1. Stripe must support the country your business is registered in (Nigeria isn't supported; a US company is). Create the account for VDC Express Logistics and set the statement descriptor.
 2. Set `TP_STRIPE_SECRET_KEY`, `TP_STRIPE_PUBLISHABLE_KEY` (test keys first) and `TP_FRONTEND_URL`.
-3. Add the webhook endpoint `https://<api-domain>/api/stripe/webhook` with `payment_intent.succeeded`, `payment_intent.payment_failed` and `payment_intent.canceled`, and put its signing secret in `TP_STRIPE_WEBHOOK_SECRET`.
+3. Add the webhook endpoint `https://<api-domain>/api/stripe/webhook` with `payment_intent.succeeded`, `payment_intent.payment_failed` and `payment_intent.canceled`. No signing secret is needed.
 4. Test with card 4242 4242 4242 4242 (any future date, any CVC), 4000 0027 6000 3184 (3-D Secure pop-up) and 4000 0000 0000 0002 (declined).
 
 Without keys, the site shows prices but booking returns "Online card payments aren't set up yet".
@@ -78,7 +78,7 @@ Environment variables:
 | `TP_CORS_ORIGINS` | the frontend URL(s), e.g. `https://vdcexpresslogistics.com,https://vdc-express.vercel.app` |
 | `TP_CORS_ORIGIN_REGEX` | optional, to allow the frontend's preview deployments |
 | `TP_ALLOWED_HOSTS` | your custom API domain, if any (`*.vercel.app` is allowed automatically) |
-| `TP_STRIPE_SECRET_KEY`, `TP_STRIPE_PUBLISHABLE_KEY`, `TP_STRIPE_WEBHOOK_SECRET` | Stripe API keys and webhook signing secret (card payments) |
+| `TP_STRIPE_SECRET_KEY`, `TP_STRIPE_PUBLISHABLE_KEY` | Stripe API keys (card payments) |
 | `TP_FRONTEND_URL` | the website URL customers return to after paying, e.g. `https://vdcexpresslogistics.com` |
 | `TP_ADMIN_EMAIL`, `TP_ADMIN_PASSWORD`, `TP_COMPANY_*`, `TP_CURRENCY_*`, `TP_FUEL_SURCHARGE`, `TP_VAT_RATE` | as in `.env.example` |
 

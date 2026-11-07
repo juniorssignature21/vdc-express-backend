@@ -367,6 +367,27 @@ def test_stripe_intent_is_card_only(monkeypatch, settings):
     assert sent["options"] == {"idempotency_key": "k"}
 
 
+def test_webhook_without_signing_secret(client, gateway, settings):
+    """No TP_STRIPE_WEBHOOK_SECRET: events are unsigned triggers; Stripe itself decides whether a booking is paid."""
+    import json as _json
+    from tracking.models import Booking
+    settings.STRIPE = {**settings.STRIPE, "WEBHOOK_SECRET": ""}
+    body = client.post("/api/bookings", BOOKING, format="json").json()
+
+    def event(pid):
+        return _json.dumps({"type": "payment_intent.succeeded", "data": {"object": {"id": pid}}})
+    # forged "succeeded" event while Stripe still says unpaid: nothing is booked
+    assert client.post("/api/stripe/webhook", event("pi_1"), content_type="application/json").status_code == 200
+    assert Booking.objects.get(reference=body["reference"]).status == "awaiting_payment"
+    assert client.post("/api/stripe/webhook", event("pi_999"), content_type="application/json").status_code == 200
+    assert client.post("/api/stripe/webhook", event("BK-1"), content_type="application/json").status_code == 400
+    assert client.post("/api/stripe/webhook", "not json", content_type="application/json").status_code == 400
+
+    _succeed(gateway["intents"]["pi_1"])  # really paid at Stripe
+    assert client.post("/api/stripe/webhook", event("pi_1"), content_type="application/json").status_code == 200
+    assert Booking.objects.get(reference=body["reference"]).status == "paid"
+
+
 def test_booking_rejects_wrong_payments_and_bad_webhooks(client, gateway):
     body = client.post("/api/bookings", BOOKING, format="json").json()
     _succeed(gateway["intents"]["pi_1"], amount_received=100)  # paid $1
