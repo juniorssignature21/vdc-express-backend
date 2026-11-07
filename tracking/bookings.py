@@ -1,8 +1,9 @@
-"""Quotes and online booking with card-only payment (Paystack).
+"""Quotes and online booking with card-only payment (Flutterwave Standard hosted checkout).
 
-Flow: POST /api/bookings (priced on the server) -> Paystack hosted card checkout -> customer returns to
-/book/confirm -> GET /api/bookings/verify re-checks the transaction with Paystack -> shipment + PAID receipt.
-The webhook (POST /api/paystack/webhook) runs the same idempotent finalisation, so a closed browser tab still books.
+Flow: POST /api/bookings (priced on the server) -> Flutterwave card checkout -> customer returns to
+/book/confirm?status=...&tx_ref=...&transaction_id=... -> GET /api/bookings/verify re-checks the transaction with
+Flutterwave -> shipment + PAID receipt. The webhook (POST /api/flutterwave/webhook) runs the same idempotent
+finalisation, so a closed browser tab still books.
 """
 import json
 import logging
@@ -21,7 +22,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from . import paystack
+from . import flutterwave
 from .countries import country_name
 from .models import Booking, Payment, Shipment
 from .pricing import QuoteError, calc_quote, option_for
@@ -69,18 +70,23 @@ def full_address(party, country):
 
 
 def _start_checkout(b: Booking) -> dict:
+    b.charge_amount, b.charge_currency = flutterwave.charge_for(b.amount)  # rate fixed per attempt
+    b.save(update_fields=["charge_amount", "charge_currency"])
+    shipper = (b.details or {}).get("shipper") or {}
     try:
-        data = paystack.initialize(
-            email=b.email, amount=b.amount, currency=b.currency, reference=b.pay_reference,
-            callback_url=f"{settings.FRONTEND_URL}/book/confirm",
-            metadata={"booking": b.reference, "product": b.product,
-                      "custom_fields": [{"display_name": "Booking", "variable_name": "booking", "value": b.reference}]},
+        data = flutterwave.initialize(
+            email=b.email, name=shipper.get("name", ""), phone=shipper.get("phone", ""),
+            amount=b.charge_amount, currency=b.charge_currency, reference=b.pay_reference,
+            redirect_url=f"{settings.FRONTEND_URL}/book/confirm",
+            title=settings.FLUTTERWAVE["CHECKOUT_TITLE"], logo=settings.FLUTTERWAVE["CHECKOUT_LOGO"],
+            description=f"{settings.TRACKPRO['COMPANY_NAME']} · {b.product} shipment · booking {b.reference}",
+            meta={"booking": b.reference, "product": b.product, "price": f"{b.amount:.2f} {b.currency}"},
         )
-    except paystack.PaystackError as e:
+    except flutterwave.GatewayError as e:
         b.gateway_message = str(e)[:255]
         b.save(update_fields=["gateway_message"])
         raise GatewayError(str(e))
-    return {"reference": b.reference, "authorization_url": data["authorization_url"]}
+    return {"reference": b.reference, "authorization_url": data["link"]}
 
 
 class BookingCreateView(APIView):
@@ -89,7 +95,7 @@ class BookingCreateView(APIView):
     throttle_scope = "public_form"
 
     def post(self, request):
-        if not paystack.enabled():
+        if not flutterwave.enabled():
             raise PaymentUnavailable("Online card payments aren't set up yet. Please contact us to book.")
         s = BookingSerializer(data=request.data)
         s.is_valid(raise_exception=True)
@@ -112,7 +118,7 @@ class BookingCreateView(APIView):
 
 
 class BookingRetryView(APIView):
-    """Start a fresh card checkout for a booking that wasn't paid (Paystack references are single-use)."""
+    """Start a fresh card checkout for a booking that wasn't paid (charge references are single-use)."""
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "public_form"
@@ -131,7 +137,8 @@ class BookingRetryView(APIView):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def booking_verify_view(request):
-    ref = (request.query_params.get("reference") or request.query_params.get("trxref") or "").strip()
+    q = request.query_params
+    ref = (q.get("tx_ref") or q.get("reference") or "").strip()
     if not ref:
         raise ValidationError("Missing payment reference.")
     b = Booking.objects.filter(pay_reference=ref).first() or Booking.objects.filter(reference__iexact=ref).first()
@@ -139,59 +146,80 @@ def booking_verify_view(request):
         raise NotFound("We couldn't find that booking.")
     if b.status != "paid":
         try:
-            finalize(b.pay_reference)
-        except paystack.PaystackError as e:
+            finalize(b.pay_reference, returned_status=q.get("status", ""))
+        except flutterwave.GatewayError as e:
             raise GatewayError(str(e))
         b.refresh_from_db()
     return Response(BookingPublicSerializer(b).data)
 
 
 @csrf_exempt
-def paystack_webhook(request):
+def flutterwave_webhook(request):
     if request.method != "POST":
         return HttpResponse(status=405)
-    if not paystack.valid_signature(request.body, request.headers.get("x-paystack-signature", "")):
+    if not flutterwave.valid_webhook(request.headers.get("verif-hash", "")):
         return HttpResponse(status=401)
     try:
         event = json.loads(request.body)
     except ValueError:
         return HttpResponse(status=400)
-    if event.get("event") == "charge.success":
-        ref = (event.get("data") or {}).get("reference", "")
+    if event.get("event") == "charge.completed":
+        ref = (event.get("data") or {}).get("tx_ref", "")
         try:
-            finalize(ref)
-        except paystack.PaystackError:
-            log.exception("Paystack verify failed for %s", ref)
-            return HttpResponse(status=502)  # Paystack retries
+            finalize(ref)  # always re-queries Flutterwave; the webhook body is only a trigger
+        except flutterwave.NotFound:
+            pass
+        except flutterwave.GatewayError:
+            log.exception("Flutterwave verify failed for %s", ref)
+            return HttpResponse(status=502)  # Flutterwave retries (if retries are on in the dashboard)
     return HttpResponse(status=200)
 
 
-def finalize(pay_reference: str):
-    """Verify the transaction with Paystack and, once, turn the booking into a paid shipment. Idempotent."""
-    if not Booking.objects.filter(pay_reference=pay_reference).exclude(status="paid").exists():
+def _amount_ok(paid, expected: float) -> bool:
+    try:
+        return float(paid) >= float(expected) - 0.005
+    except (TypeError, ValueError):
+        return False
+
+
+def finalize(pay_reference: str, returned_status: str = ""):
+    """Verify the transaction with Flutterwave and, once, turn the booking into a paid shipment. Idempotent;
+    a booking marked failed is still completed if a late successful payment for it turns up."""
+    if not pay_reference or not Booking.objects.filter(pay_reference=pay_reference).exclude(status="paid").exists():
         return
-    data = paystack.verify(pay_reference)  # network call outside the DB transaction
+    try:
+        data = flutterwave.verify(pay_reference)  # network call outside the DB transaction
+    except flutterwave.NotFound:
+        if returned_status in ("cancelled", "failed"):  # closed the checkout without paying
+            Booking.objects.filter(pay_reference=pay_reference, status="awaiting_payment").update(
+                status="failed", gateway_message="Payment cancelled")
+            return
+        raise
     with transaction.atomic():
         b = Booking.objects.select_for_update().filter(pay_reference=pay_reference).first()
         if b is None or b.status == "paid":
             return
-        auth = data.get("authorization") or {}
         state = data.get("status")
-        matches = (data.get("amount") == paystack.to_subunit(b.amount)
-                   and (data.get("currency") or "").upper() == b.currency.upper() and data.get("channel") == "card")
-        if state != "success" or not matches:
-            if state == "success":  # money taken, but not what we asked for: flag for staff
+        charge_amount = b.charge_amount if b.charge_amount is not None else b.amount
+        charge_currency = b.charge_currency or b.currency
+        matches = (data.get("tx_ref") == pay_reference
+                   and _amount_ok(data.get("charged_amount", data.get("amount")), charge_amount)
+                   and (data.get("currency") or "").upper() == charge_currency.upper()
+                   and data.get("payment_type") == "card")
+        if state != "successful" or not matches:
+            if state == "successful":  # money taken, but not what we asked for: flag for staff
                 b.status = "failed"
-                b.gateway_message = f"Mismatch: {data.get('amount')} {data.get('currency')} via {data.get('channel')}"
+                b.gateway_message = (f"Mismatch: {data.get('charged_amount', data.get('amount'))} "
+                                     f"{data.get('currency')} via {data.get('payment_type')}")
                 log.error("Booking %s: %s", b.reference, b.gateway_message)
             else:
-                if state in ("failed", "abandoned", "reversed"):
+                if state == "failed":
                     b.status = "failed"
-                b.gateway_message = (data.get("gateway_response") or state or "")[:255]
+                b.gateway_message = str(data.get("processor_response") or state or "")[:255]
             b.save(update_fields=["status", "gateway_message"])
             return
-        b.card = f"{(auth.get('card_type') or 'Card').strip().upper()} •••• {auth.get('last4') or '----'}"
-        b.gateway_message = data.get("gateway_response", "")[:255]
+        b.card = flutterwave.card_label(data)
+        b.gateway_message = str(data.get("processor_response") or "Approved")[:255]
         b.shipment = _create_shipment(b)
         b.status, b.paid_at = "paid", timezone.now()
         b.save()
@@ -229,7 +257,9 @@ def _create_shipment(b: Booking) -> Shipment:
         shipment=sh, receipt_number=new_receipt_number(), method="Card", reference=b.card, stamp="PAID",
         items=[{"label": ln["label"], "amount": ln["amount"]} for ln in o["lines"]],
         vat_rate=q.get("tax_rate", 0), payer_name=shipper["name"], paid_at=now,
-        note=f"Online booking {b.reference} · Paystack {b.pay_reference}",
+        note=f"Online booking {b.reference} · Flutterwave {b.pay_reference}" + (
+            f" · card charged {b.charge_amount:,.2f} {b.charge_currency}"
+            if b.charge_currency and b.charge_currency != b.currency else ""),
     )
     return sh
 

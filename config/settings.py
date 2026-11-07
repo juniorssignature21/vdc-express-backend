@@ -193,10 +193,25 @@ TRACKPRO = {
     "TIME_ZONE": env("BUSINESS_TIME_ZONE", "America/Chicago"),  # for the daily pickup cut-off
 }
 
-# Public site URL (no trailing slash): Paystack returns customers here after paying.
+# Public site URL (no trailing slash): Flutterwave returns customers here after paying.
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 
-# Paystack (card-only online checkout). Use sk_test_... keys until you go live.
-PAYSTACK = {
-    "SECRET_KEY": env("PAYSTACK_SECRET_KEY"),
+# Flutterwave Standard (card-only hosted checkout). Use FLWSECK_TEST-... keys until you go live.
+# Cards are charged in CURRENCY (default: the site currency, USD; USD must be enabled on your Flutterwave account).
+# If USD isn't available, set TP_FLUTTERWAVE_CURRENCY=NGN and TP_FLUTTERWAVE_FX_RATE (naira per $1).
+FLUTTERWAVE = {
+    "SECRET_KEY": env("FLUTTERWAVE_SECRET_KEY"),
+    "SECRET_HASH": env("FLUTTERWAVE_SECRET_HASH"),  # Settings -> Webhooks -> Secret hash (sent as verif-hash)
+    "CURRENCY": (env("FLUTTERWAVE_CURRENCY") or TRACKPRO["CURRENCY_CODE"]).upper(),
+    "FX_RATE": float(env("FLUTTERWAVE_FX_RATE", "0") or 0),
+    # Branding on the hosted checkout. Always sent, so the page shows these instead of the name and logo of the
+    # Flutterwave business that owns the API key. The logo must be a public https URL (square works best).
+    "CHECKOUT_TITLE": env("CHECKOUT_TITLE") or TRACKPRO["COMPANY_NAME"],
+    "CHECKOUT_LOGO": env("CHECKOUT_LOGO") or f"{FRONTEND_URL}/branding/vdc-icon-512.png",
 }
+if FLUTTERWAVE["CURRENCY"] == TRACKPRO["CURRENCY_CODE"].upper():
+    FLUTTERWAVE["FX_RATE"] = 1.0
+elif FLUTTERWAVE["SECRET_KEY"] and FLUTTERWAVE["FX_RATE"] <= 0:
+    raise ImproperlyConfigured(
+        f"Prices are in {TRACKPRO['CURRENCY_CODE']} but cards are charged in {FLUTTERWAVE['CURRENCY']}: "
+        "set TP_FLUTTERWAVE_FX_RATE to the exchange rate.")

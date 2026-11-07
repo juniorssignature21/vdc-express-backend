@@ -18,7 +18,7 @@ urlpatterns = [
     path("bookings", bookings.BookingCreateView.as_view()),
     path("bookings/verify", bookings.booking_verify_view),
     path("bookings/<str:reference>/pay", bookings.BookingRetryView.as_view()),
-    path("paystack/webhook", bookings.paystack_webhook),
+    path("flutterwave/webhook", bookings.flutterwave_webhook),
     path("quotes", views.QuoteRequestCreateView.as_view()),
     path("contact", views.ContactCreateView.as_view()),
     # admin

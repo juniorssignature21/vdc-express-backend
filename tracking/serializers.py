@@ -1,7 +1,7 @@
 from django.conf import settings
 from rest_framework import serializers
 
-from . import paystack
+from . import flutterwave
 from .countries import COUNTRIES, NOT_SERVED, country_list
 from .models import (
     COURIER_CONTACT_SERVICES, SERVICE_TYPES, STATUSES, Booking, ContactMessage, Payment, QuoteRequest, Shipment,
@@ -207,7 +207,8 @@ class BookingPublicSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Booking
-        fields = ["reference", "status", "product", "amount", "currency", "card", "gateway_message", "quote",
+        fields = ["reference", "status", "product", "amount", "currency", "charge_amount", "charge_currency",
+                  "card", "gateway_message", "quote",
                   "tracking_number", "receipt_number", "created_at", "paid_at"]
 
     def get_tracking_number(self, b):
@@ -323,7 +324,9 @@ def site_settings() -> dict:
         "international_from": prices["international"],
         "countries": country_list(),
         "limits": {"pieces": MAX_PIECES, "piece_kg": MAX_PIECE_KG, "side_cm": MAX_SIDE_CM},
-        "payments_enabled": paystack.enabled(),
+        "payments_enabled": flutterwave.enabled(),
+        "payment_currency": settings.FLUTTERWAVE["CURRENCY"],
+        "payment_fx_rate": settings.FLUTTERWAVE["FX_RATE"],
         "stamps": ["PAID", "PART PAID", "CUSTOMS CLEARED", "REFUNDED", "UNPAID"],
         "max_upload_mb": settings.MAX_UPLOAD_MB,
     }

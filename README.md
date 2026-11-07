@@ -1,6 +1,6 @@
 # VDC Express Logistics API (Django REST Framework)
 
-Backend for the VDC Express Logistics site: express-integrator pricing, online booking with card-only payment (Paystack), shipments, tracking events, receipts, package photos, quote requests, contact messages and staff login with JWT. The project is in `config/` and the app is `tracking/`. The React frontend lives in its own repo and talks to this API over HTTPS.
+Backend for the VDC Express Logistics site: express-integrator pricing, online booking with card-only payment (Flutterwave), shipments, tracking events, receipts, package photos, quote requests, contact messages and staff login with JWT. The project is in `config/` and the app is `tracking/`. The React frontend lives in its own repo and talks to this API over HTTPS.
 
 ## Run it (development)
 
@@ -34,16 +34,26 @@ Pricing lives in [tracking/pricing.py](tracking/pricing.py) and zones in [tracki
 
 The rate numbers are starting values: review `EXPRESS_RATES`, the surcharges and the transit table against your carrier contracts before going live.
 
-## Online booking and card payments (Paystack)
+## Online booking and card payments (Flutterwave)
 
-1. `POST /api/bookings` validates addresses and contents, prices the shipment on the server and opens a **card-only** Paystack checkout (`channels: ["card"]`).
-2. The customer pays on Paystack and returns to `TP_FRONTEND_URL/book/confirm`.
-3. `GET /api/bookings/verify` re-checks the transaction with Paystack (status, amount, currency and that the channel is `card`) and only then creates the shipment, a tracking event and a PAID receipt.
-4. `POST /api/paystack/webhook` (signature-checked) runs the same idempotent step, so a closed browser tab still gets booked.
+Uses **Flutterwave Standard**, the hosted checkout: card details are typed on Flutterwave's page and never reach this server, so no PCI DSS certificate is needed (unlike Flutterwave's direct card-charge API).
 
-A payment for the wrong amount or by another channel is flagged as failed and shows up under **Online bookings** in the admin. Failed or abandoned payments can be retried with a new card.
+1. `POST /api/bookings` validates addresses and contents, prices the shipment on the server and creates a **card-only** payment link (`payment_options: "card"`).
+2. The customer pays on Flutterwave and returns to `TP_FRONTEND_URL/book/confirm?status=…&tx_ref=…&transaction_id=…`.
+3. `GET /api/bookings/verify` re-queries the transaction by `tx_ref` (status `successful`, amount, currency, `payment_type: card`) and only then creates the shipment, a tracking event and a PAID receipt.
+4. `POST /api/flutterwave/webhook` (`verif-hash` header checked) runs the same idempotent step, so a closed browser tab still gets booked. The webhook body is only a trigger: the transaction is always re-queried from Flutterwave.
 
-Setup: put your secret key in `TP_PAYSTACK_SECRET_KEY` (start with `sk_test_…`), set `TP_FRONTEND_URL`, and add `https://<api-domain>/api/paystack/webhook` as the webhook URL in the Paystack dashboard. Charging in USD requires a Paystack business with USD enabled; otherwise change `TP_CURRENCY_CODE`/`TP_CURRENCY_SYMBOL` to a currency your account supports. Without a key, the site shows prices but booking returns "Online card payments aren't set up yet".
+A payment for the wrong amount or by another method is flagged as failed and shows up under **Online bookings** in the admin. Cancelled or declined payments can be retried with a new card.
+
+**Currency.** Cards are charged in USD, the site currency, which must be enabled on your Flutterwave account. If it isn't, set `TP_FLUTTERWAVE_CURRENCY=NGN` and `TP_FLUTTERWAVE_FX_RATE=<naira per $1>`: the booking page then shows the naira amount before the customer pays and the receipt stays in USD with a note of the amount charged.
+
+Setup:
+1. Put your secret key (`FLWSECK_TEST-…` first) in `TP_FLUTTERWAVE_SECRET_KEY` and set `TP_FRONTEND_URL`.
+2. In the dashboard under Settings → Webhooks, set the URL `https://<api-domain>/api/flutterwave/webhook`, choose a secret hash and put the same value in `TP_FLUTTERWAVE_SECRET_HASH`. Turn on webhook retries.
+3. If the checkout still offers other payment methods, turn off the dashboard's preferred / dashboard payment options setting so `payment_options` is respected.
+4. Test with Flutterwave's test cards, e.g. Visa 4187 4274 1556 4246, 09/32, CVV 828, OTP 12345.
+
+Without a key, the site shows prices but booking returns "Online card payments aren't set up yet".
 
 ## Tests
 
@@ -68,7 +78,8 @@ Environment variables:
 | `TP_CORS_ORIGINS` | the frontend URL(s), e.g. `https://vdcexpresslogistics.com,https://vdc-express.vercel.app` |
 | `TP_CORS_ORIGIN_REGEX` | optional, to allow the frontend's preview deployments |
 | `TP_ALLOWED_HOSTS` | your custom API domain, if any (`*.vercel.app` is allowed automatically) |
-| `TP_PAYSTACK_SECRET_KEY` | Paystack secret key (card checkout) |
+| `TP_FLUTTERWAVE_SECRET_KEY`, `TP_FLUTTERWAVE_SECRET_HASH` | Flutterwave secret key and webhook secret hash (card checkout) |
+| `TP_FLUTTERWAVE_CURRENCY`, `TP_FLUTTERWAVE_FX_RATE` | only if USD isn't enabled: charge e.g. `NGN` at `1550` per $1 |
 | `TP_FRONTEND_URL` | the website URL customers return to after paying, e.g. `https://vdcexpresslogistics.com` |
 | `TP_ADMIN_EMAIL`, `TP_ADMIN_PASSWORD`, `TP_COMPANY_*`, `TP_CURRENCY_*`, `TP_FUEL_SURCHARGE`, `TP_VAT_RATE` | as in `.env.example` |
 
