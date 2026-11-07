@@ -11,7 +11,7 @@ load_dotenv(BASE_DIR / ".env")
 
 
 def env(name, default=""):
-    return os.environ.get(f"TP_{name}", default)
+    return os.environ.get(f"{name}", default)
 
 
 def env_bool(name, default=False):
