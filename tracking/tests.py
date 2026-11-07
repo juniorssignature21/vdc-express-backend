@@ -16,11 +16,12 @@ PNG = bytes.fromhex(
 @pytest.fixture(autouse=True)
 def _setup(db, settings, tmp_path):
     settings.MEDIA_ROOT = tmp_path / "uploads"
+    # never write test files to a real bucket configured in .env
+    settings.STORAGES = {**settings.STORAGES, "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"}}
     settings.TRACKPRO = {**settings.TRACKPRO, "ADMIN_EMAIL": "admin@trackpro.local", "ADMIN_PASSWORD": "admin123",
                          "FUEL_SURCHARGE": 0.18, "VAT_RATE": 0, "CURRENCY_CODE": "USD", "CURRENCY_SYMBOL": "$"}
-    settings.FLUTTERWAVE = {"SECRET_KEY": "FLWSECK_TEST-dummy", "SECRET_HASH": "hook-secret",
-                            "CURRENCY": "USD", "FX_RATE": 1.0, "CHECKOUT_TITLE": "VDC Express Logistics",
-                            "CHECKOUT_LOGO": "https://vdcexpresslogistics.com/branding/vdc-icon-512.png"}
+    settings.STRIPE = {"SECRET_KEY": "sk_test_dummy", "PUBLISHABLE_KEY": "pk_test_dummy", "WEBHOOK_SECRET": "whsec_test",
+                       "CURRENCY": "USD", "STATEMENT_SUFFIX": "", "SEND_RECEIPTS": False}
     cache.clear()  # reset throttling counters
     ensure_admin()
     seed_demo()
@@ -245,7 +246,7 @@ def _txt():
     return SimpleUploadedFile("x.txt", b"hi", content_type="text/plain")
 
 
-# ------------------------------------------------------------------ online booking + Flutterwave (mocked)
+# ------------------------------------------------------------------ online booking + Stripe (mocked)
 BOOKING = {
     "origin_country": "US", "dest_country": "GB", "pieces": 1, "weight_kg": 2, "length_cm": 30, "width_cm": 20,
     "height_cm": 10, "product": "Express", "contents": "Cotton T-shirts", "customs_value": 120, "accept_terms": True,
@@ -258,29 +259,36 @@ BOOKING = {
 
 @pytest.fixture
 def gateway(monkeypatch):
-    from tracking import flutterwave
-    calls = {"init": [], "verify": {}}
+    """In-memory stand-in for Stripe PaymentIntents."""
+    intents, created = {}, []
 
-    def initialize(**kw):
-        calls["init"].append(kw)
-        return {"link": f"https://checkout.flutterwave.test/v3/hosted/pay/{kw['reference']}"}
+    def create_intent(*, amount, currency, email, description, metadata, idempotency_key):
+        pid = f"pi_{len(intents) + 1}"
+        intents[pid] = {"id": pid, "client_secret": f"{pid}_secret_x", "status": "requires_payment_method",
+                        "amount": round(amount * 100), "amount_received": 0, "currency": currency.lower(),
+                        "metadata": dict(metadata), "payment_method_types": ["card"], "latest_charge": None,
+                        "last_payment_error": None}
+        created.append({"amount": amount, "currency": currency, "description": description,
+                        "idempotency_key": idempotency_key, "id": pid})
+        return dict(intents[pid])
 
-    def verify(reference):
-        if reference not in calls["verify"]:
-            raise flutterwave.NotFound("No transaction was found for this id")
-        return calls["verify"][reference]
+    def retrieve_intent(pid):
+        return dict(intents[pid])
 
-    monkeypatch.setattr("tracking.flutterwave.initialize", initialize)
-    monkeypatch.setattr("tracking.flutterwave.verify", verify)
-    return calls
+    monkeypatch.setattr("tracking.stripe_gateway.create_intent", create_intent)
+    monkeypatch.setattr("tracking.stripe_gateway.retrieve_intent", retrieve_intent)
+    return {"intents": intents, "created": created}
 
 
-def _paid(init, **over):
-    # shape of GET /transactions/verify_by_reference (amounts in main units)
-    return {"id": 285959875, "tx_ref": init["reference"], "status": "successful", "amount": init["amount"],
-            "charged_amount": init["amount"], "currency": init["currency"], "payment_type": "card",
-            "processor_response": "Approved", "card": {"first_6digits": "418742", "last_4digits": "4246",
-                                                       "type": "VISA", "issuer": " CREDIT"}, **over}
+def _succeed(intent, **over):
+    intent.update({"status": "succeeded", "amount_received": intent["amount"], "last_payment_error": None,
+                   "latest_charge": {"payment_method_details": {"type": "card",
+                                                                "card": {"brand": "visa", "last4": "4242"}}},
+                   **over})
+
+
+def _decline(intent, message="Your card was declined."):
+    intent.update(status="requires_payment_method", last_payment_error={"message": message})
 
 
 def test_booking_card_payment_flow(client, admin, gateway):
@@ -289,35 +297,32 @@ def test_booking_card_payment_flow(client, admin, gateway):
 
     r = client.post("/api/bookings", BOOKING, format="json")
     assert r.status_code == 201, r.content
-    init = gateway["init"][0]
-    assert init["currency"] == "USD" and init["email"] == "ada@example.com" and init["name"] == "Ada Lovelace"
-    assert init["redirect_url"].endswith("/book/confirm") and r.json()["authorization_url"].startswith("https://checkout")
+    body = r.json()
+    made = gateway["created"][0]
+    assert body["client_secret"] == "pi_1_secret_x" and body["publishable_key"] == "pk_test_dummy"
+    assert made["currency"] == "USD" and "VDC Express Logistics" in made["description"]
     quote = client.post("/api/quote/calculate", BOOKING, format="json").json()
     express = next(o for o in quote["options"] if o["product"] == "Express")
-    assert init["amount"] == express["total"]  # priced on the server, charged in USD
-    # the checkout shows the site's business, not the Flutterwave account's
-    assert init["title"] == "VDC Express Logistics" and init["logo"].startswith("https://")
-    assert "VDC Express Logistics" in init["description"]
+    assert made["amount"] == express["total"] == body["amount"]  # priced on the server
+    assert client.get("/api/settings").json()["stripe_publishable_key"] == "pk_test_dummy"
 
-    # customer closes the checkout without paying (no transaction exists at Flutterwave), then retries and pays
-    v = client.get("/api/bookings/verify", {"reference": init["reference"], "status": "cancelled"}).json()
-    assert v["status"] == "failed" and v["tracking_number"] is None and v["gateway_message"] == "Payment cancelled"
-    retry = client.post(f"/api/bookings/{r.json()['reference']}/pay").json()
-    second = gateway["init"][1]
-    assert second["reference"] != init["reference"] and second["reference"] in retry["authorization_url"]
+    # not paid yet: stays open
+    v = client.get("/api/bookings/verify", {"reference": body["reference"]}).json()
+    assert v["status"] == "awaiting_payment"
 
-    # a declined card
-    gateway["verify"][second["reference"]] = {**_paid(second), "status": "failed", "processor_response": "Do Not Honour"}
-    v = client.get("/api/bookings/verify", {"reference": second["reference"], "status": "failed"}).json()
-    assert v["status"] == "failed" and v["gateway_message"] == "Do Not Honour"
-    client.post(f"/api/bookings/{r.json()['reference']}/pay")
-    third = gateway["init"][2]
+    # declined card: failed, then the same PaymentIntent is reused for another card
+    _decline(gateway["intents"]["pi_1"])
+    v = client.get("/api/bookings/verify", {"reference": body["reference"]}).json()
+    assert v["status"] == "failed" and v["tracking_number"] is None and v["gateway_message"] == "Your card was declined."
+    retry = client.post(f"/api/bookings/{body['reference']}/pay").json()
+    assert retry["client_secret"] == "pi_1_secret_x" and len(gateway["created"]) == 1
 
-    gateway["verify"][third["reference"]] = _paid(third)
-    v = client.get("/api/bookings/verify", {"tx_ref": third["reference"], "status": "successful"}).json()
-    assert v["status"] == "paid" and v["card"] == "VISA •••• 4246" and is_valid_waybill(v["tracking_number"])
-    again = client.get("/api/bookings/verify", {"reference": third["reference"]}).json()  # idempotent
+    _succeed(gateway["intents"]["pi_1"])
+    v = client.get("/api/bookings/verify", {"payment_intent": "pi_1"}).json()  # 3-D Secure redirect return
+    assert v["status"] == "paid" and v["card"] == "VISA •••• 4242" and is_valid_waybill(v["tracking_number"])
+    again = client.get("/api/bookings/verify", {"reference": body["reference"]}).json()  # idempotent
     assert again["tracking_number"] == v["tracking_number"]
+    assert client.post(f"/api/bookings/{body['reference']}/pay").json()["status"] == "paid"
 
     track = client.get(f"/api/track/{v['tracking_number']}").json()
     assert track["service_type"] == "Express" and track["dest_country"] == "GB" and track["status"] == "pending"
@@ -331,75 +336,66 @@ def test_booking_card_payment_flow(client, admin, gateway):
     assert admin.get(f"/api/admin/shipments/{sh['id']}/quote").json()["total"] == express["total"]
 
 
-def test_flutterwave_request_is_card_only(monkeypatch):
-    from tracking import flutterwave
+def test_canceled_intent_gets_a_fresh_one(client, gateway):
+    body = client.post("/api/bookings", BOOKING, format="json").json()
+    gateway["intents"]["pi_1"]["status"] = "canceled"
+    assert client.get("/api/bookings/verify", {"reference": body["reference"]}).json()["status"] == "failed"
+    retry = client.post(f"/api/bookings/{body['reference']}/pay").json()
+    assert retry["client_secret"] == "pi_2_secret_x"
+    assert gateway["created"][1]["idempotency_key"].endswith("-2")
+    _succeed(gateway["intents"]["pi_2"])
+    assert client.get("/api/bookings/verify", {"reference": body["reference"]}).json()["status"] == "paid"
+
+
+def test_stripe_intent_is_card_only(monkeypatch, settings):
+    from tracking import stripe_gateway
     sent = {}
 
-    def fake_call(method, path, payload=None):
-        sent.update(payload, path=path)
-        return {"link": "x"}
-    monkeypatch.setattr(flutterwave, "_call", fake_call)
-    flutterwave.initialize(email="a@b.c", name="A", phone="+1", amount=98.53, currency="USD", reference="BK-1-ABC-1",
-                           redirect_url="u", title="t", description="d", logo="l", meta={"booking": "BK"})
-    assert sent["path"] == "/payments" and sent["payment_options"] == "card" and sent["tx_ref"] == "BK-1-ABC-1"
-    assert sent["amount"] == 98.53 and sent["currency"] == "USD" and sent["customer"]["email"] == "a@b.c"
+    class FakeIntents:
+        def create(self, params, options):
+            sent.update(params=params, options=options)
+            return {"id": "pi_x", "client_secret": "s"}
+
+    class FakeClient:
+        payment_intents = FakeIntents()
+
+    monkeypatch.setattr(stripe_gateway, "_client", lambda: FakeClient())
+    stripe_gateway.create_intent(amount=98.53, currency="USD", email="a@b.c", description="d",
+                                 metadata={"booking": "BK"}, idempotency_key="k")
+    assert sent["params"]["payment_method_types"] == ["card"] and sent["params"]["amount"] == 9853
+    assert sent["params"]["currency"] == "usd" and "receipt_email" not in sent["params"]
+    assert sent["options"] == {"idempotency_key": "k"}
 
 
 def test_booking_rejects_wrong_payments_and_bad_webhooks(client, gateway):
-    client.post("/api/bookings", BOOKING, format="json")
-    init = gateway["init"][0]
-    gateway["verify"][init["reference"]] = _paid(init, charged_amount=1)  # paid far too little
-    v = client.get("/api/bookings/verify", {"reference": init["reference"]}).json()
+    body = client.post("/api/bookings", BOOKING, format="json").json()
+    _succeed(gateway["intents"]["pi_1"], amount_received=100)  # paid $1
+    v = client.get("/api/bookings/verify", {"reference": body["reference"]}).json()
     assert v["status"] == "failed" and v["tracking_number"] is None and "Mismatch" in v["gateway_message"]
 
-    client.post("/api/bookings", BOOKING, format="json")
-    init_b = gateway["init"][1]
-    gateway["verify"][init_b["reference"]] = _paid(init_b, payment_type="bank_transfer")  # not a card
-    assert client.get("/api/bookings/verify", {"reference": init_b["reference"]}).json()["status"] == "failed"
+    body_b = client.post("/api/bookings", BOOKING, format="json").json()
+    _succeed(gateway["intents"]["pi_2"], metadata={"booking": "BK-OTHER"})  # someone else's payment
+    assert client.get("/api/bookings/verify", {"reference": body_b["reference"]}).json()["status"] == "failed"
 
-    # no transaction yet and no cancel signal: report the gateway state, don't fail the booking
-    client.post("/api/bookings", BOOKING, format="json")
-    init_c = gateway["init"][2]
-    assert client.get("/api/bookings/verify", {"reference": init_c["reference"]}).status_code == 502
-
+    import hashlib
+    import hmac
     import json as _json
-    client.post("/api/bookings", BOOKING, format="json")
-    init2 = gateway["init"][3]
-    gateway["verify"][init2["reference"]] = _paid(init2)
-    body = _json.dumps({"event": "charge.completed", "data": {"id": 1, "tx_ref": init2["reference"], "status": "successful"}})
-    assert client.post("/api/flutterwave/webhook", body, content_type="application/json",
-                       HTTP_VERIF_HASH="forged").status_code == 401
-    assert client.post("/api/flutterwave/webhook", body, content_type="application/json").status_code == 401
-    assert client.post("/api/flutterwave/webhook", body, content_type="application/json",
-                       HTTP_VERIF_HASH="hook-secret").status_code == 200
-    v = client.get("/api/bookings/verify", {"reference": init2["reference"]}).json()
-    assert v["status"] == "paid" and v["tracking_number"]
+    import time
+    body2 = client.post("/api/bookings", BOOKING, format="json").json()
+    _succeed(gateway["intents"]["pi_3"])
+    payload = _json.dumps({"id": "evt_1", "object": "event", "type": "payment_intent.succeeded",
+                           "data": {"object": {"id": "pi_3", "object": "payment_intent"}}})
+    assert client.post("/api/stripe/webhook", payload, content_type="application/json",
+                       HTTP_STRIPE_SIGNATURE="t=1,v1=forged").status_code == 400
+    t = int(time.time())
+    sig = hmac.new(b"whsec_test", f"{t}.{payload}".encode(), hashlib.sha256).hexdigest()
+    assert client.post("/api/stripe/webhook", payload, content_type="application/json",
+                       HTTP_STRIPE_SIGNATURE=f"t={t},v1={sig}").status_code == 200
+    from tracking.models import Booking
+    assert Booking.objects.get(reference=body2["reference"]).status == "paid"  # booked by the webhook alone
 
 
 def test_booking_needs_payments_configured(client, settings):
-    settings.FLUTTERWAVE = {**settings.FLUTTERWAVE, "SECRET_KEY": ""}
+    settings.STRIPE = {**settings.STRIPE, "SECRET_KEY": ""}
     r = client.post("/api/bookings", BOOKING, format="json")
     assert r.status_code == 503 and "contact us" in r.json()["detail"]
-
-
-def test_booking_charged_in_local_currency(client, gateway, settings):
-    """Fallback when USD isn't enabled: price in USD, card charged in naira at the configured rate."""
-    settings.FLUTTERWAVE = {**settings.FLUTTERWAVE, "CURRENCY": "NGN", "FX_RATE": 1500.0}
-    assert client.get("/api/settings").json()["payment_currency"] == "NGN"
-    r = client.post("/api/bookings", BOOKING, format="json")
-    assert r.status_code == 201, r.content
-    init = gateway["init"][0]
-    quote = client.post("/api/quote/calculate", BOOKING, format="json").json()
-    usd = next(o for o in quote["options"] if o["product"] == "Express")["total"]
-    assert init["currency"] == "NGN" and init["amount"] == round(usd * 1500, 2)
-
-    gateway["verify"][init["reference"]] = _paid(init, currency="USD")  # wrong currency
-    assert client.get("/api/bookings/verify", {"reference": init["reference"]}).json()["status"] == "failed"
-
-    client.post(f"/api/bookings/{r.json()['reference']}/pay")
-    second = gateway["init"][1]
-    gateway["verify"][second["reference"]] = _paid(second)
-    v = client.get("/api/bookings/verify", {"reference": second["reference"]}).json()
-    assert v["status"] == "paid" and v["amount"] == usd and v["charge_currency"] == "NGN"
-    rec = client.get("/api/receipts", {"r": v["receipt_number"]}).json()[0]
-    assert rec["payment"]["total"] == usd and "NGN" in rec["payment"]["note"]

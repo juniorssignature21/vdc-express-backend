@@ -210,18 +210,18 @@ class ContactMessage(models.Model):
 
 
 class Booking(models.Model):
-    """An online booking. The shipment is only created once Flutterwave confirms the card payment."""
+    """An online booking. The shipment is only created once Stripe confirms the card payment."""
     STATES = [(s, s.replace("_", " ").title()) for s in ("awaiting_payment", "paid", "failed")]
 
     reference = models.CharField(max_length=32, unique=True)          # ours, shown to the customer
-    pay_reference = models.CharField(max_length=64, unique=True)      # current Flutterwave tx_ref
+    pay_reference = models.CharField(max_length=64, unique=True)      # current Stripe PaymentIntent id (pi_...)
     status = models.CharField(max_length=20, choices=STATES, default="awaiting_payment")
     email = models.EmailField()
     product = models.CharField(max_length=32, choices=SERVICE_CHOICES)
     amount = models.FloatField()
     currency = models.CharField(max_length=3)
-    # What the card is actually charged for the current attempt (e.g. NGN
-    # at TP_FLUTTERWAVE_FX_RATE, while amount/currency hold the USD price).
+    # What the card is actually charged (same as amount/currency with Stripe; kept separate so a gateway that
+    # charges in another currency can be audited).
     charge_amount = models.FloatField(null=True, blank=True)
     charge_currency = models.CharField(max_length=3, blank=True)
     quote = models.JSONField(default=dict)    # priced option + route, frozen at booking time

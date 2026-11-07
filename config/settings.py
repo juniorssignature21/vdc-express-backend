@@ -193,25 +193,16 @@ TRACKPRO = {
     "TIME_ZONE": env("BUSINESS_TIME_ZONE", "America/Chicago"),  # for the daily pickup cut-off
 }
 
-# Public site URL (no trailing slash): Flutterwave returns customers here after paying.
+# Public site URL (no trailing slash). Used for links back to the site (e.g. after a 3-D Secure redirect).
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 
-# Flutterwave Standard (card-only hosted checkout). Use FLWSECK_TEST-... keys until you go live.
-# Cards are charged in CURRENCY (default: the site currency, USD; USD must be enabled on your Flutterwave account).
-# If USD isn't available, set TP_FLUTTERWAVE_CURRENCY=NGN and TP_FLUTTERWAVE_FX_RATE (naira per $1).
-FLUTTERWAVE = {
-    "SECRET_KEY": env("FLUTTERWAVE_SECRET_KEY"),
-    "SECRET_HASH": env("FLUTTERWAVE_SECRET_HASH"),  # Settings -> Webhooks -> Secret hash (sent as verif-hash)
-    "CURRENCY": (env("FLUTTERWAVE_CURRENCY") or TRACKPRO["CURRENCY_CODE"]).upper(),
-    "FX_RATE": float(env("FLUTTERWAVE_FX_RATE", "0") or 0),
-    # Branding on the hosted checkout. Always sent, so the page shows these instead of the name and logo of the
-    # Flutterwave business that owns the API key. The logo must be a public https URL (square works best).
-    "CHECKOUT_TITLE": env("CHECKOUT_TITLE") or TRACKPRO["COMPANY_NAME"],
-    "CHECKOUT_LOGO": env("CHECKOUT_LOGO") or f"{FRONTEND_URL}/branding/vdc-icon-512.png",
+# Stripe: card payments taken on our own booking page with the Payment Element (no hosted checkout redirect).
+# Keys: dashboard -> Developers -> API keys (use the test keys, sk_test_/pk_test_, until you go live).
+STRIPE = {
+    "SECRET_KEY": env("STRIPE_SECRET_KEY"),
+    "PUBLISHABLE_KEY": env("STRIPE_PUBLISHABLE_KEY"),     # safe to expose; sent to the page via /api/settings
+    "WEBHOOK_SECRET": env("STRIPE_WEBHOOK_SECRET"),       # whsec_... from the webhook endpoint you add
+    "CURRENCY": TRACKPRO["CURRENCY_CODE"].upper(),        # charged in the site currency (USD)
+    "STATEMENT_SUFFIX": env("STRIPE_STATEMENT_SUFFIX"),   # optional, appended to the account's statement descriptor
+    "SEND_RECEIPTS": env_bool("STRIPE_SEND_RECEIPTS", False),  # Stripe's own emailed receipt (we issue our own)
 }
-if FLUTTERWAVE["CURRENCY"] == TRACKPRO["CURRENCY_CODE"].upper():
-    FLUTTERWAVE["FX_RATE"] = 1.0
-elif FLUTTERWAVE["SECRET_KEY"] and FLUTTERWAVE["FX_RATE"] <= 0:
-    raise ImproperlyConfigured(
-        f"Prices are in {TRACKPRO['CURRENCY_CODE']} but cards are charged in {FLUTTERWAVE['CURRENCY']}: "
-        "set TP_FLUTTERWAVE_FX_RATE to the exchange rate.")

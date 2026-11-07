@@ -1,6 +1,6 @@
 # VDC Express Logistics API (Django REST Framework)
 
-Backend for the VDC Express Logistics site: express-integrator pricing, online booking with card-only payment (Flutterwave), shipments, tracking events, receipts, package photos, quote requests, contact messages and staff login with JWT. The project is in `config/` and the app is `tracking/`. The React frontend lives in its own repo and talks to this API over HTTPS.
+Backend for the VDC Express Logistics site: express-integrator pricing, online booking with card payment on the site (Stripe), shipments, tracking events, receipts, package photos, quote requests, contact messages and staff login with JWT. The project is in `config/` and the app is `tracking/`. The React frontend lives in its own repo and talks to this API over HTTPS.
 
 ## Run it (development)
 
@@ -34,26 +34,26 @@ Pricing lives in [tracking/pricing.py](tracking/pricing.py) and zones in [tracki
 
 The rate numbers are starting values: review `EXPRESS_RATES`, the surcharges and the transit table against your carrier contracts before going live.
 
-## Online booking and card payments (Flutterwave)
+## Online booking and card payments (Stripe)
 
-Uses **Flutterwave Standard**, the hosted checkout: card details are typed on Flutterwave's page and never reach this server, so no PCI DSS certificate is needed (unlike Flutterwave's direct card-charge API).
+Customers pay on the booking page itself with Stripe's **Payment Element**: there is no redirect to a hosted checkout. The card fields are Stripe iframes, so card numbers go straight to Stripe and never reach this server (PCI DSS SAQ A: no certificate needed, just Stripe's yearly self-assessment questionnaire). 3-D Secure, when the bank asks for it, opens as a pop-up over the page.
 
-1. `POST /api/bookings` validates addresses and contents, prices the shipment on the server and creates a **card-only** payment link (`payment_options: "card"`).
-2. The customer pays on Flutterwave and returns to `TP_FRONTEND_URL/book/confirm?status=…&tx_ref=…&transaction_id=…`.
-3. `GET /api/bookings/verify` re-queries the transaction by `tx_ref` (status `successful`, amount, currency, `payment_type: card`) and only then creates the shipment, a tracking event and a PAID receipt.
-4. `POST /api/flutterwave/webhook` (`verif-hash` header checked) runs the same idempotent step, so a closed browser tab still gets booked. The webhook body is only a trigger: the transaction is always re-queried from Flutterwave.
+1. `POST /api/bookings` validates addresses and contents, prices the shipment on the server and creates a **card-only** PaymentIntent (`payment_method_types: ["card"]`). It returns the `client_secret` and publishable key.
+2. The page mounts the Payment Element and confirms the payment in place (`redirect: "if_required"`).
+3. `GET /api/bookings/verify?reference=…` re-reads the PaymentIntent from Stripe (`succeeded`, `amount_received`, currency, booking reference in the metadata, paid by card) and only then creates the shipment, a tracking event and a PAID receipt.
+4. `POST /api/stripe/webhook` (`Stripe-Signature` verified) runs the same idempotent step, so a closed browser tab still gets booked.
 
-A payment for the wrong amount or by another method is flagged as failed and shows up under **Online bookings** in the admin. Cancelled or declined payments can be retried with a new card.
+A declined card keeps the same PaymentIntent, so the customer can try another card on the confirmation page (`POST /api/bookings/<ref>/pay`). A payment for the wrong amount or another booking is flagged as failed and shows up under **Online bookings** in the admin.
 
-**Currency.** Cards are charged in USD, the site currency, which must be enabled on your Flutterwave account. If it isn't, set `TP_FLUTTERWAVE_CURRENCY=NGN` and `TP_FLUTTERWAVE_FX_RATE=<naira per $1>`: the booking page then shows the naira amount before the customer pays and the receipt stays in USD with a note of the amount charged.
+What customers see from Stripe: only the card fields. Your business name appears on their **card statement** (the account's statement descriptor, set in Stripe → Settings → Public details), so open the Stripe account for VDC Express Logistics.
 
 Setup:
-1. Put your secret key (`FLWSECK_TEST-…` first) in `TP_FLUTTERWAVE_SECRET_KEY` and set `TP_FRONTEND_URL`.
-2. In the dashboard under Settings → Webhooks, set the URL `https://<api-domain>/api/flutterwave/webhook`, choose a secret hash and put the same value in `TP_FLUTTERWAVE_SECRET_HASH`. Turn on webhook retries.
-3. If the checkout still offers other payment methods, turn off the dashboard's preferred / dashboard payment options setting so `payment_options` is respected.
-4. Test with Flutterwave's test cards, e.g. Visa 4187 4274 1556 4246, 09/32, CVV 828, OTP 12345.
+1. Stripe must support the country your business is registered in (Nigeria isn't supported; a US company is). Create the account for VDC Express Logistics and set the statement descriptor.
+2. Set `TP_STRIPE_SECRET_KEY`, `TP_STRIPE_PUBLISHABLE_KEY` (test keys first) and `TP_FRONTEND_URL`.
+3. Add the webhook endpoint `https://<api-domain>/api/stripe/webhook` with `payment_intent.succeeded`, `payment_intent.payment_failed` and `payment_intent.canceled`, and put its signing secret in `TP_STRIPE_WEBHOOK_SECRET`.
+4. Test with card 4242 4242 4242 4242 (any future date, any CVC), 4000 0027 6000 3184 (3-D Secure pop-up) and 4000 0000 0000 0002 (declined).
 
-Without a key, the site shows prices but booking returns "Online card payments aren't set up yet".
+Without keys, the site shows prices but booking returns "Online card payments aren't set up yet".
 
 ## Tests
 
@@ -78,8 +78,7 @@ Environment variables:
 | `TP_CORS_ORIGINS` | the frontend URL(s), e.g. `https://vdcexpresslogistics.com,https://vdc-express.vercel.app` |
 | `TP_CORS_ORIGIN_REGEX` | optional, to allow the frontend's preview deployments |
 | `TP_ALLOWED_HOSTS` | your custom API domain, if any (`*.vercel.app` is allowed automatically) |
-| `TP_FLUTTERWAVE_SECRET_KEY`, `TP_FLUTTERWAVE_SECRET_HASH` | Flutterwave secret key and webhook secret hash (card checkout) |
-| `TP_FLUTTERWAVE_CURRENCY`, `TP_FLUTTERWAVE_FX_RATE` | only if USD isn't enabled: charge e.g. `NGN` at `1550` per $1 |
+| `TP_STRIPE_SECRET_KEY`, `TP_STRIPE_PUBLISHABLE_KEY`, `TP_STRIPE_WEBHOOK_SECRET` | Stripe API keys and webhook signing secret (card payments) |
 | `TP_FRONTEND_URL` | the website URL customers return to after paying, e.g. `https://vdcexpresslogistics.com` |
 | `TP_ADMIN_EMAIL`, `TP_ADMIN_PASSWORD`, `TP_COMPANY_*`, `TP_CURRENCY_*`, `TP_FUEL_SURCHARGE`, `TP_VAT_RATE` | as in `.env.example` |
 

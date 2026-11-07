@@ -1,7 +1,7 @@
 from django.conf import settings
 from rest_framework import serializers
 
-from . import flutterwave
+from . import stripe_gateway
 from .countries import COUNTRIES, NOT_SERVED, country_list
 from .models import (
     COURIER_CONTACT_SERVICES, SERVICE_TYPES, STATUSES, Booking, ContactMessage, Payment, QuoteRequest, Shipment,
@@ -324,9 +324,10 @@ def site_settings() -> dict:
         "international_from": prices["international"],
         "countries": country_list(),
         "limits": {"pieces": MAX_PIECES, "piece_kg": MAX_PIECE_KG, "side_cm": MAX_SIDE_CM},
-        "payments_enabled": flutterwave.enabled(),
-        "payment_currency": settings.FLUTTERWAVE["CURRENCY"],
-        "payment_fx_rate": settings.FLUTTERWAVE["FX_RATE"],
+        "payments_enabled": stripe_gateway.enabled(),
+        "payment_currency": settings.STRIPE["CURRENCY"],
+        "payment_fx_rate": 1,
+        "stripe_publishable_key": settings.STRIPE["PUBLISHABLE_KEY"],
         "stamps": ["PAID", "PART PAID", "CUSTOMS CLEARED", "REFUNDED", "UNPAID"],
         "max_upload_mb": settings.MAX_UPLOAD_MB,
     }
